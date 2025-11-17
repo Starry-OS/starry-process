@@ -21,10 +21,25 @@ pub(crate) struct ThreadGroup {
     pub(crate) group_exited: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZombieInfo {
+    pub exit_code: i32,
+    pub signal: Option<i32>,
+    pub core_dumped: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessState {
+    Running,
+    Stopped { signal: i32 },
+    Continued,
+    Zombie { info: ZombieInfo },
+}
+
 /// A process.
 pub struct Process {
     pid: Pid,
-    is_zombie: AtomicBool,
+    state: SpinNoIrq<ProcessState>,
     pub(crate) tg: SpinNoIrq<ThreadGroup>,
 
     // TODO: child subreaper9
@@ -32,6 +47,8 @@ pub struct Process {
     parent: SpinNoIrq<Weak<Process>>,
 
     group: SpinNoIrq<Arc<ProcessGroup>>,
+    continued_unacked: AtomicBool,
+    stopped_unacked: AtomicBool,
 }
 
 impl Process {
@@ -187,13 +204,68 @@ impl Process {
     }
 }
 
-/// Status & exit
+/// Status, exit, stop & cont
 impl Process {
     /// Returns `true` if the [`Process`] is a zombie process.
     pub fn is_zombie(&self) -> bool {
-        self.is_zombie.load(Ordering::Acquire)
+        matches!(*self.state.lock(), ProcessState::Zombie { .. })
     }
 
+    pub fn get_zombie_info(&self) -> Option<ZombieInfo> {
+        if let ProcessState::Zombie { info } = *self.state.lock() {
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        matches!(*self.state.lock(), ProcessState::Stopped { .. }) || self.stopped_unacked.load(Ordering::Acquire)
+    }
+
+    pub fn state_snapshot(&self) -> ProcessState {
+        *self.state.lock()
+    }
+
+    pub fn stopped_unacked(&self) -> bool {
+        self.stopped_unacked.load(Ordering::Acquire)
+    }
+
+    pub fn set_stopped_by_signal(&self, signal: i32) {
+        *self.state.lock() = ProcessState::Stopped { signal };
+    }
+
+    pub fn get_stop_signal(&self) -> Option<i32> {
+        if let ProcessState::Stopped { signal } = *self.state.lock() {
+            Some(signal)
+        } else {
+            None
+        }
+    }
+
+    pub fn ack_stopped(&self) {
+        self.stopped_unacked.store(false, Ordering::Release);
+    }
+
+    pub fn is_continued(&self) -> bool {
+        matches!(*self.state.lock(), ProcessState::Continued) || self.continued_unacked.load(Ordering::Acquire)
+    }
+
+    pub fn continue_from_stop(&self) {
+        let mut state = self.state.lock();
+        if matches!(*state, ProcessState::Stopped { .. }) {
+            *state = ProcessState::Continued;
+            self.continued_unacked.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn ack_continued(&self) {
+        let mut state = self.state.lock();
+        if matches!(*state, ProcessState::Continued) {
+            *state = ProcessState::Running;
+        }
+        self.continued_unacked.store(false, Ordering::Release);
+    }
     /// Terminates the [`Process`], marking it as a zombie process.
     ///
     /// Child processes are inherited by the init process or by the nearest
@@ -209,7 +281,40 @@ impl Process {
         }
 
         let mut children = self.children.lock(); // Acquire the lock first
-        self.is_zombie.store(true, Ordering::Release);
+        let exit_code = self.tg.lock().exit_code;
+        *self.state.lock() = ProcessState::Zombie {
+            info: ZombieInfo {
+                exit_code,
+                signal: None,
+                core_dumped: false,
+            },
+        };
+
+        let mut reaper_children = reaper.children.lock();
+        let reaper = Arc::downgrade(reaper);
+
+        for (pid, child) in core::mem::take(&mut *children) {
+            *child.parent.lock() = reaper.clone();
+            reaper_children.insert(pid, child);
+        }
+    }
+
+    pub fn exit_with_signal(self: &Arc<Self>, signal: i32, core_dumped: bool) {
+        let reaper = INIT_PROC.get().unwrap();
+
+        if Arc::ptr_eq(self, reaper) {
+            return;
+        }
+
+        let mut children = self.children.lock(); // Acquire the lock first
+        let exit_code = 128 + signal;
+        *self.state.lock() = ProcessState::Zombie {
+            info: ZombieInfo {
+                exit_code,
+                signal: Some(signal),
+                core_dumped,
+            },
+        };
 
         let mut reaper_children = reaper.children.lock();
         let reaper = Arc::downgrade(reaper);
@@ -229,6 +334,11 @@ impl Process {
         if let Some(parent) = self.parent() {
             parent.children.lock().remove(&self.pid);
         }
+    }
+
+    pub fn stop_by_signal(&self, stop_signal: i32) {
+        *self.state.lock() = ProcessState::Stopped { signal: stop_signal };
+        self.stopped_unacked.store(true, Ordering::Release);
     }
 }
 
@@ -266,11 +376,13 @@ impl Process {
 
         let process = Arc::new(Process {
             pid,
-            is_zombie: AtomicBool::new(false),
+            state: SpinNoIrq::new(ProcessState::Running),
             tg: SpinNoIrq::new(ThreadGroup::default()),
             children: SpinNoIrq::new(StrongMap::new()),
             parent: SpinNoIrq::new(parent.as_ref().map(Arc::downgrade).unwrap_or_default()),
             group: SpinNoIrq::new(group.clone()),
+            continued_unacked: AtomicBool::new(false),
+            stopped_unacked: AtomicBool::new(false),
         });
 
         group.processes.lock().insert(pid, &process);
