@@ -21,19 +21,35 @@ pub(crate) struct ThreadGroup {
     pub(crate) group_exited: bool,
 }
 
+/// Store basic information about a zombie process
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZombieInfo {
+    /// exit_code of the process
     pub exit_code: i32,
+    /// signal that terminates the process if any, an option field
     pub signal: Option<i32>,
+    /// indicator of any core_dump
+    /// currently a placeholder, unimplemented
     pub core_dumped: bool,
 }
 
+/// Process State during the entire lifecycle
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
+    /// State for process just inited or actually executing
     Running,
-    Stopped { signal: i32 },
+    /// State for signal-stopped process
+    Stopped {
+        /// Corresponding signal of the stopped process
+        signal: i32
+    },
+    /// State for process just continued but whose parent has not been notified
     Continued,
-    Zombie { info: ZombieInfo },
+    /// State for process just finished executing
+    Zombie {
+        /// Relative info of the zombie process
+        info: ZombieInfo
+    },
 }
 
 /// A process.
@@ -211,6 +227,7 @@ impl Process {
         matches!(*self.state.lock(), ProcessState::Zombie { .. })
     }
 
+    /// Get the information of the process ig it is a zombie
     pub fn get_zombie_info(&self) -> Option<ZombieInfo> {
         if let ProcessState::Zombie { info } = *self.state.lock() {
             Some(info)
@@ -219,22 +236,29 @@ impl Process {
         }
     }
 
+    /// Check whether the process has stopped,
+    /// including both the case which the process just stopped without acked by its parent
+    /// and already acked by its parent
     pub fn is_stopped(&self) -> bool {
         matches!(*self.state.lock(), ProcessState::Stopped { .. }) || self.stopped_unacked.load(Ordering::Acquire)
     }
 
+    /// A real-time quick snapshot of the process's state
     pub fn state_snapshot(&self) -> ProcessState {
         *self.state.lock()
     }
 
+    /// Check whether the process's Stoppage has been acked by its parent
     pub fn stopped_unacked(&self) -> bool {
         self.stopped_unacked.load(Ordering::Acquire)
     }
 
+    /// Set the process to be stopped with the corresponding signal
     pub fn set_stopped_by_signal(&self, signal: i32) {
         *self.state.lock() = ProcessState::Stopped { signal };
     }
 
+    /// Get the corresponding signal of a stopped process if it is stopped
     pub fn get_stop_signal(&self) -> Option<i32> {
         if let ProcessState::Stopped { signal } = *self.state.lock() {
             Some(signal)
@@ -243,14 +267,19 @@ impl Process {
         }
     }
 
+    /// Set the stoppage of the process has been acked by its parent
     pub fn ack_stopped(&self) {
         self.stopped_unacked.store(false, Ordering::Release);
     }
 
+    /// Check whether the process has continued from the stoppage,
+    /// including both the case which the process just continued without acked by its parent
+    /// and already acked by its parent
     pub fn is_continued(&self) -> bool {
         matches!(*self.state.lock(), ProcessState::Continued) || self.continued_unacked.load(Ordering::Acquire)
     }
 
+    /// Updating the status of a process continued from stoppage 
     pub fn continue_from_stop(&self) {
         let mut state = self.state.lock();
         if matches!(*state, ProcessState::Stopped { .. }) {
@@ -259,6 +288,7 @@ impl Process {
         }
     }
 
+    /// Update the statue of the process after its continuation has been acked by its parent
     pub fn ack_continued(&self) {
         let mut state = self.state.lock();
         if matches!(*state, ProcessState::Continued) {
@@ -266,6 +296,7 @@ impl Process {
         }
         self.continued_unacked.store(false, Ordering::Release);
     }
+
     /// Terminates the [`Process`], marking it as a zombie process.
     ///
     /// Child processes are inherited by the init process or by the nearest
@@ -299,6 +330,12 @@ impl Process {
         }
     }
 
+    /// Terminates the [`Process`], marking it as a zombie process ONLY when the termination is due to a signal
+    ///
+    /// Child processes are inherited by the init process or by the nearest
+    /// subreaper process.
+    ///
+    /// This method panics if the [`Process`] is the init process.
     pub fn exit_with_signal(self: &Arc<Self>, signal: i32, core_dumped: bool) {
         let reaper = INIT_PROC.get().unwrap();
 
@@ -336,6 +373,7 @@ impl Process {
         }
     }
 
+    /// Stops the [`Process`], marking it as stopped when a signal stops it(majorly SIGSTOP)
     pub fn stop_by_signal(&self, stop_signal: i32) {
         *self.state.lock() = ProcessState::Stopped { signal: stop_signal };
         self.stopped_unacked.store(true, Ordering::Release);
