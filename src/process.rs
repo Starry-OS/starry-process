@@ -38,10 +38,18 @@ pub struct ZombieInfo {
 pub enum ProcessState {
     /// State for process just inited or actually executing
     Running,
-    /// State for signal-stopped process
+    /// State for signal-stopped process, including both signal-stops and ptrace-stops
     Stopped {
-        /// Corresponding signal of the stopped process
-        signal: i32
+        /// Signal number for reporting to parent/tracer.
+        /// For signal-stops: actual signal (SIGSTOP=19, SIGTSTP=20, etc.)
+        /// For ptrace-stops: SIGTRAP=5 (or with 0x80 for syscall-stops)
+        signal: i32,
+
+        /// Whether this is a ptrace-stop (vs signal-stop).
+        /// - signal-stops: visible to parent via waitpid(WUNTRACED)
+        /// - ptrace-stops: only visible to tracer
+        /// - SIGCONT resumes signal-stops but NOT ptrace-stops
+        is_ptrace_stopped: bool,
     },
     /// State for process just continued but whose parent has not been notified
     Continued,
@@ -255,15 +263,19 @@ impl Process {
 
     /// Set the process to be stopped with the corresponding signal
     pub fn set_stopped_by_signal(&self, signal: i32) {
-        *self.state.lock() = ProcessState::Stopped { signal };
+        *self.state.lock() = ProcessState::Stopped { signal, is_ptrace_stopped: false };
+        self.stopped_unacked.store(true, Ordering::Release);
     }
 
-    /// Get the corresponding signal of a stopped process if it is stopped
+    /// Get the stop signal if the process is in any stopped state.
+    ///
+    /// # Returns
+    /// * `Some(signal)` if process is stopped (signal-stop or ptrace-stop)
+    /// * `None` if process is running, continued, or zombie
     pub fn get_stop_signal(&self) -> Option<i32> {
-        if let ProcessState::Stopped { signal } = *self.state.lock() {
-            Some(signal)
-        } else {
-            None
+        match *self.state.lock() {
+            ProcessState::Stopped { signal, .. } => Some(signal),
+            _ => None,
         }
     }
 
@@ -375,8 +387,62 @@ impl Process {
 
     /// Stops the [`Process`], marking it as stopped when a signal stops it(majorly SIGSTOP)
     pub fn stop_by_signal(&self, stop_signal: i32) {
-        *self.state.lock() = ProcessState::Stopped { signal: stop_signal };
+        *self.state.lock() = ProcessState::Stopped { signal: stop_signal, is_ptrace_stopped: false };
         self.stopped_unacked.store(true, Ordering::Release);
+    }
+
+    /// Set the process to be stopped due to a ptrace event.
+    ///
+    /// This is similar to signal-stops but is only visible to the tracer,
+    /// not the parent. The signal parameter is typically SIGTRAP (5) for
+    /// syscall-stops and exec-stops, or the actual signal number for
+    /// signal-delivery-stops.
+    ///
+    /// # Arguments
+    /// * `signal` - Signal to report via waitpid (SIGTRAP or actual signal)
+    pub fn set_ptrace_stopped(&self, signal: i32) {
+        *self.state.lock() = ProcessState::Stopped {
+            signal,
+            is_ptrace_stopped: true,
+        };
+        self.stopped_unacked.store(true, Ordering::Release);
+    }
+
+    /// Check if the process is in a ptrace-stop state.
+    ///
+    /// # Returns
+    /// * `true` if process is stopped due to ptrace
+    /// * `false` if running, signal-stopped, continued, or zombie
+    pub fn is_ptrace_stopped(&self) -> bool {
+        matches!(
+            *self.state.lock(),
+            ProcessState::Stopped { is_ptrace_stopped: true, .. }
+        )
+    }
+
+    /// Check if the process is in a signal-stop state (not ptrace).
+    ///
+    /// # Returns
+    /// * `true` if process is stopped due to signal (SIGSTOP, etc.)
+    /// * `false` if running, ptrace-stopped, continued, or zombie
+    pub fn is_signal_stopped(&self) -> bool {
+        matches!(
+            *self.state.lock(),
+            ProcessState::Stopped { is_ptrace_stopped: false, .. }
+        )
+    }
+
+    /// Resume from ptrace-stop by transitioning back to Running state.
+    ///
+    /// This is called by the tracer via PTRACE_CONT/SYSCALL/DETACH.
+    /// Unlike signal-stops which go through Continued state, ptrace
+    /// resumes directly to Running.
+    pub fn resume_from_ptrace_stop(&self) {
+        let mut state = self.state.lock();
+        if matches!(*state, ProcessState::Stopped { is_ptrace_stopped: true, .. }) {
+            *state = ProcessState::Running;
+            self.stopped_unacked.store(false, Ordering::Release);
+        }
     }
 }
 
