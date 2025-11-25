@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2025 KylinSoft Co., Ltd. https://www.kylinos.cn/
+// Copyright (C) 2025 Azure-stars Azure_stars@126.com
+// ...[and other authors]
+// See LICENSES for license details.
+
 //! Process state management implementation.
 //!
 //! # Architecture Overview
