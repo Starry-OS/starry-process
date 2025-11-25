@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2025 KylinSoft Co., Ltd. https://www.kylinos.cn/
 // Copyright (C) 2025 Azure-stars Azure_stars@126.com
-// ...[and other authors]
 // See LICENSES for license details.
 
 //! Process state management implementation.
@@ -380,7 +379,7 @@ impl Process {
 
     /// Updating the status of a process continued from stoppage
     pub fn continue_from_stop(&self) {
-        self.state.lock().transition_to_running();
+        self.state.lock().transition_to_running(true);
     }
 
     /// Attempts to consume the 'continued' event for `waitpid(WCONTINUED)`.
@@ -534,7 +533,7 @@ impl Process {
     /// Unlike signal-stops which go through Continued state, ptrace
     /// resumes directly to Running.
     pub fn resume_from_ptrace_stop(&self) {
-        self.state.lock().transition_to_running();
+        self.state.lock().transition_to_running(false);
     }
 }
 
@@ -599,7 +598,7 @@ impl Process {
     }
 
     /// Creates a child [`Process`].
-    pub fn fork(self: &Arc<Process>, pid: Pid) -> Arc<Process> {
+    pub fn fork(self: &Arc<Self>, pid: Pid) -> Arc<Process> {
         Self::new(pid, Some(self.clone()))
     }
 }
@@ -653,20 +652,23 @@ impl ProcessState {
     /// Transitions the process state from `Stopped` to `Running`.
     ///
     /// This method is called when a stopped process is resumed (e.g., via
-    /// `SIGCONT` or `PTRACE_CONT`). It updates the state kind to `Running`
-    /// and sets the `CONTINUED_UNACKED` flag, indicating that the parent
-    /// has not yet acknowledged this continuation (via `waitpid` with
-    /// `WCONTINUED`).
+    /// `SIGCONT` or `PTRACE_CONT`). It updates the state kind to `Running`.
     ///
-    /// It also clears the `STOPPED_UNACKED` flag, as the process is no longer
-    /// stopped, even if the parent may not be aware that there is a
-    /// stop-continue event happened.
+    /// If `with_continued_flag` is true, it sets the `CONTINUED_UNACKED` flag,
+    /// indicating that the parent has not yet acknowledged this continuation
+    /// (via `waitpid` with `WCONTINUED`). Ptrace resumes typically pass
+    /// `false`.
     ///
-    /// If the process is not currently `Stopped`, this method does nothing.
-    pub fn transition_to_running(&mut self) {
+    /// It also clears the `STOPPED_UNACKED` flag.
+    ///
+    /// # Arguments
+    /// * `with_continued_flag` - Whether to set the `CONTINUED_UNACKED` flag.
+    pub fn transition_to_running(&mut self, with_continued_flag: bool) {
         if let ProcessStateKind::Stopped { .. } = self.kind {
             self.kind = ProcessStateKind::Running;
-            self.flags.insert(ProcessStateFlags::CONTINUED_UNACKED);
+            if with_continued_flag {
+                self.flags.insert(ProcessStateFlags::CONTINUED_UNACKED);
+            }
             self.flags.remove(ProcessStateFlags::STOPPED_UNACKED);
         }
     }
@@ -698,13 +700,15 @@ impl ProcessState {
     /// This ensures that a stop event is reported exactly once to a parent
     /// calling `waitpid`.
     pub fn try_consume_stopped(&mut self) -> Option<i32> {
-        if self.flags.contains(ProcessStateFlags::STOPPED_UNACKED) {
-            if let ProcessStateKind::Stopped { signal, .. } = self.kind {
+        match self.kind {
+            ProcessStateKind::Stopped { signal, .. }
+                if self.flags.contains(ProcessStateFlags::STOPPED_UNACKED) =>
+            {
                 self.flags.remove(ProcessStateFlags::STOPPED_UNACKED);
-                return Some(signal);
+                Some(signal)
             }
+            _ => None,
         }
-        None
     }
 
     /// Attempts to consume the 'continued' event for `waitpid(WCONTINUED)`.

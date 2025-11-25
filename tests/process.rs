@@ -71,3 +71,82 @@ fn thread_exit() {
     assert!(last2);
     assert_eq!(child.exit_code(), 7);
 }
+
+#[test]
+fn test_stop_continue_integration() {
+    let parent = init_proc();
+    let child = parent.new_child();
+
+    // Initial state
+    assert!(!child.is_stopped());
+    assert!(!child.is_continued());
+
+    // Stop the process
+    let sig_stop = 19; // SIGSTOP
+    child.stop_by_signal(sig_stop);
+
+    assert!(child.is_stopped());
+    assert!(child.is_signal_stopped());
+    assert!(!child.is_ptrace_stopped());
+
+    // Consume stopped event
+    assert_eq!(child.try_consume_stopped(), Some(sig_stop));
+
+    // Should be consumed now (still stopped, but event consumed)
+    assert!(child.is_stopped());
+    assert_eq!(child.try_consume_stopped(), None);
+
+    // Continue the process
+    child.continue_from_stop();
+
+    assert!(!child.is_stopped());
+    assert!(child.is_continued());
+
+    // Consume continued event
+    assert!(child.try_consume_continued());
+
+    // Should be consumed now
+    assert!(!child.try_consume_continued());
+}
+
+#[test]
+fn test_ptrace_integration() {
+    let parent = init_proc();
+    let child = parent.new_child();
+
+    // Ptrace stop
+    let sig_trap = 5; // SIGTRAP
+    child.set_ptrace_stopped(sig_trap);
+
+    assert!(child.is_stopped());
+    assert!(child.is_ptrace_stopped());
+    assert!(!child.is_signal_stopped());
+
+    // Ptrace stops are NOT consumed by standard waitpid (try_consume_stopped)
+    assert_eq!(child.try_consume_stopped(), None);
+
+    // Resume from ptrace
+    child.resume_from_ptrace_stop();
+
+    assert!(!child.is_stopped());
+    assert!(!child.is_ptrace_stopped());
+
+    // Resume from ptrace does NOT set continued flag
+    assert!(!child.is_continued());
+}
+
+#[test]
+fn test_exit_signal_integration() {
+    let parent = init_proc();
+    let child = parent.new_child();
+
+    let sig_kill = 9; // SIGKILL
+    child.exit_with_signal(sig_kill, false);
+
+    assert!(child.is_zombie());
+
+    let info = child.get_zombie_info().expect("Should have zombie info");
+    assert_eq!(info.signal, Some(sig_kill));
+    assert_eq!(info.exit_code.as_raw(), 128 + sig_kill);
+    assert!(!info.core_dumped);
+}
