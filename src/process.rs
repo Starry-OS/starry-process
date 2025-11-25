@@ -457,7 +457,7 @@ impl Process {
     /// Child processes are inherited by the init process or by the nearest
     /// subreaper process.
     ///
-    /// This method panics if the [`Process`] is the init process.
+    /// This method silently returns if the [`Process`] is the init process.
     pub fn exit_with_signal(self: &Arc<Self>, signal: i32, core_dumped: bool) {
         let reaper = INIT_PROC.get().unwrap();
 
@@ -487,7 +487,7 @@ impl Process {
     }
 
     /// Stops the [`Process`], marking it as stopped when a signal stops
-    /// it(majorly SIGSTOP)
+    /// it (majorly SIGSTOP)
     pub fn stop_by_signal(&self, stop_signal: i32) {
         self.state.lock().transition_to_stopped(stop_signal, false);
     }
