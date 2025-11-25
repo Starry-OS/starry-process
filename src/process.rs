@@ -431,7 +431,7 @@ impl Process {
     /// Child processes are inherited by the init process or by the nearest
     /// subreaper process.
     ///
-    /// This method panics if the [`Process`] is the init process.
+    /// This method silently returns if the [`Process`] is the init process.
     pub fn exit(self: &Arc<Self>) {
         // TODO: child subreaper
         let reaper = INIT_PROC.get().unwrap();
