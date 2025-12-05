@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Starry-OS/starry-process"
 
 [dependencies]
+bitflags.workspace = true
 kspin = "0.1"
 lazyinit = "0.2.1"
 weak-map = "0.1"

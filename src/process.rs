@@ -5,9 +5,10 @@ use alloc::{
 };
 use core::{
     fmt,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
 };
 
+use bitflags::bitflags;
 use kspin::SpinNoIrq;
 use lazyinit::LazyInit;
 use weak_map::StrongMap;
@@ -21,10 +22,31 @@ pub(crate) struct ThreadGroup {
     pub(crate) group_exited: bool,
 }
 
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(crate) struct ProcessState: u8 {
+        const RUNNING = 1 << 0;
+        const STOPPED = 1 << 1;
+        const ZOMBIE  = 1 << 2;
+    }
+}
+
+impl PartialEq<u8> for ProcessState {
+    fn eq(&self, other: &u8) -> bool {
+        self.bits() == *other
+    }
+}
+
+impl PartialEq<ProcessState> for u8 {
+    fn eq(&self, other: &ProcessState) -> bool {
+        *self == other.bits()
+    }
+}
+
 /// A process.
 pub struct Process {
     pid: Pid,
-    is_zombie: AtomicBool,
+    state: AtomicU8,
     pub(crate) tg: SpinNoIrq<ThreadGroup>,
 
     // TODO: child subreaper9
@@ -191,10 +213,97 @@ impl Process {
 impl Process {
     /// Returns `true` if the [`Process`] is a zombie process.
     pub fn is_zombie(&self) -> bool {
-        self.is_zombie.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) == ProcessState::ZOMBIE
     }
 
-    /// Terminates the [`Process`], marking it as a zombie process.
+    /// Returns `true` if the [`Process`] is running.
+    pub fn is_running(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ProcessState::RUNNING
+    }
+
+    ///  Returns `true` if the [`Process`] is stopped.
+    pub fn is_stopped(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ProcessState::STOPPED
+    }
+
+    /// Change the [`Process`] from Running to `Stopped`.
+    ///
+    /// This method atomically transitions the process state to STOPPED using
+    /// CAS, ensuring the state is either successfully changed or already in
+    /// ZOMBIE state (in which case no change occurs).
+    ///
+    /// # Memory Ordering
+    ///
+    /// Uses `Release` ordering on success to synchronize with `Acquire` loads
+    /// in `is_stopped()`. This ensures that any writes before this
+    /// transition, such as setting `stop_signal` in the
+    /// `ProcessSignalManager`, are visible to threads that observe the
+    /// `STOPPED` state transition.
+    pub fn transition_to_stopped(&self) {
+        let _ = self.state.fetch_update(
+            Ordering::Release, // Success: synchronize with is_stopped()
+            Ordering::Relaxed, // Failure: no synchronization needed
+            |curr| {
+                if curr == ProcessState::ZOMBIE.bits() {
+                    None // Already zombie, don't transition
+                } else {
+                    Some(ProcessState::STOPPED.bits())
+                }
+            },
+        );
+    }
+
+    /// Change the [`Process`] from `Stopped` to `Running`.
+    ///
+    /// This method atomically transitions the process state to RUNNING using
+    /// CAS. The transition succeeds if and only if the current state is
+    /// `STOPPED`.
+    ///
+    /// # Memory Ordering
+    ///
+    /// Uses `Release` ordering on success to synchronize with `Acquire` loads
+    /// in `is_running()`. This ensures that any writes before this
+    /// transition, for example, setting `cont_signal` in the
+    /// `ProcessSignalManager`, are visible to threads that observe the
+    /// `RUNNING` state transition.
+    pub fn transition_to_running(&self) {
+        let _ = self.state.fetch_update(
+            Ordering::Release, // Success: synchronize with is_running()
+            Ordering::Relaxed, // Failure: no synchronization needed
+            |curr| {
+                if curr != ProcessState::STOPPED.bits() {
+                    None // Not stopped, don't transition
+                } else {
+                    Some(ProcessState::RUNNING.bits())
+                }
+            },
+        );
+    }
+
+    /// Change the [`Process`] from `Stopped` or `Running` to `Zombie`.
+    ///
+    /// This is a terminal state transition - once a process becomes a zombie,
+    /// it cannot transition to any other state (it can only be freed via
+    /// `free()`).
+    ///
+    /// # Memory Ordering
+    ///
+    /// Uses `Release` ordering to synchronize with `Acquire` loads in
+    /// `is_zombie()`, ensuring that when a parent process's `wait()` observes
+    /// the ZOMBIE state, it also observes all writes that happened before
+    /// the transition, particularly the exit_code set by `exit_thread()`.
+    pub fn transition_to_zombie(&self) {
+        if self.is_zombie() {
+            return;
+        }
+
+        self.state.store(
+            ProcessState::ZOMBIE.bits(),
+            Ordering::Release, // Synchronize with is_zombie()
+        );
+    }
+
+    /// Terminates the [`Process`].
     ///
     /// Child processes are inherited by the init process or by the nearest
     /// subreaper process.
@@ -209,7 +318,6 @@ impl Process {
         }
 
         let mut children = self.children.lock(); // Acquire the lock first
-        self.is_zombie.store(true, Ordering::Release);
 
         let mut reaper_children = reaper.children.lock();
         let reaper = Arc::downgrade(reaper);
@@ -266,7 +374,7 @@ impl Process {
 
         let process = Arc::new(Process {
             pid,
-            is_zombie: AtomicBool::new(false),
+            state: AtomicU8::new(ProcessState::RUNNING.bits()),
             tg: SpinNoIrq::new(ThreadGroup::default()),
             children: SpinNoIrq::new(StrongMap::new()),
             parent: SpinNoIrq::new(parent.as_ref().map(Arc::downgrade).unwrap_or_default()),
