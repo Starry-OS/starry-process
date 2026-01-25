@@ -118,7 +118,7 @@ mod tests {
 
         let groups = session.process_groups();
         assert!(groups.iter().any(|g| g.pgid() == init.pid()));
-        assert!(groups.len() >= 1);
+        assert!(!groups.is_empty());
     }
 
     #[test]
