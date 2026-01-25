@@ -56,3 +56,92 @@ impl fmt::Debug for ProcessGroup {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Process;
+    use crate::process::is_init_initialized;
+    use alloc::{format, string::ToString};
+
+    fn ensure_init() {
+        // Try to get init proc, if it fails, initialize it
+        if !is_init_initialized() {
+            // Use a static flag to prevent multiple initializations
+            static INIT_FLAG: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !INIT_FLAG.swap(true, core::sync::atomic::Ordering::SeqCst) {
+                Process::new_init(alloc_pid());
+            } else {
+                // Another thread/test already initialized, wait a bit and check again
+                // In single-threaded tests, this shouldn't happen, but be safe
+                while !is_init_initialized() {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    fn alloc_pid() -> Pid {
+        static COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2000);
+        COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn test_pgid() {
+        ensure_init();
+        let pid = alloc_pid();
+        let session = Session::new(pid);
+        let group = ProcessGroup::new(pid, &session);
+
+        assert_eq!(group.pgid(), pid);
+    }
+
+    #[test]
+    fn test_session() {
+        ensure_init();
+        let pid = alloc_pid();
+        let session = Session::new(pid);
+        let group = ProcessGroup::new(pid, &session);
+
+        assert_eq!(group.session().sid(), session.sid());
+    }
+
+    #[test]
+    fn test_processes() {
+        ensure_init();
+        let init = crate::init_proc();
+        let group = init.group();
+
+        let processes_before = group.processes().len();
+        let child = init.fork(alloc_pid());
+
+        let processes = group.processes();
+        assert!(processes.iter().any(|p| p.pid() == init.pid()));
+        assert!(processes.iter().any(|p| p.pid() == child.pid()));
+        assert_eq!(processes.len(), processes_before + 1);
+    }
+
+    #[test]
+    fn test_processes_empty_group() {
+        ensure_init();
+        let pid = alloc_pid();
+        let session = Session::new(pid);
+        let group = ProcessGroup::new(alloc_pid(), &session);
+
+        let processes = group.processes();
+        assert!(processes.is_empty());
+    }
+
+    #[test]
+    fn test_debug() {
+        ensure_init();
+        let pid = alloc_pid();
+        let session = Session::new(pid);
+        let group = ProcessGroup::new(pid, &session);
+
+        let debug_str = format!("{:?}", group);
+        assert!(debug_str.contains("ProcessGroup"));
+        assert!(debug_str.contains(&pid.to_string()));
+    }
+}
