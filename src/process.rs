@@ -314,8 +314,9 @@ pub(crate) fn is_init_initialized() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloc::vec;
+
+    use super::*;
 
     fn ensure_init() {
         // Try to get init proc, if it fails, initialize it

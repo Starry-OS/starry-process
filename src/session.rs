@@ -73,10 +73,10 @@ impl fmt::Debug for Session {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::Process;
-    use crate::process::is_init_initialized;
     use alloc::{format, string::ToString};
+
+    use super::*;
+    use crate::{Process, process::is_init_initialized};
 
     fn ensure_init() {
         // Try to get init proc, if it fails, initialize it
