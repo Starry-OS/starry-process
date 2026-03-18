@@ -59,6 +59,7 @@ fn cleanup() {
     assert!(group.upgrade().is_some());
 
     child.exit();
+    child.transition_to_zombie();
     child.free();
     drop(child);
     assert!(group.upgrade().is_none());
@@ -134,6 +135,7 @@ fn cleanup_processes() {
     let group = parent.create_group().unwrap();
 
     parent.exit();
+    parent.transition_to_zombie();
     parent.free();
     drop(parent);
 

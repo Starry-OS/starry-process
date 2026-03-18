@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use std::any::Any;
+use std::{any::Any, sync::Arc};
 
 use starry_process::init_proc;
 
@@ -59,6 +58,7 @@ fn cleanup() {
 
     assert!(session.upgrade().is_some());
     child.exit();
+    child.transition_to_zombie();
     child.free();
     drop(child);
     assert!(session.upgrade().is_none());
@@ -102,6 +102,7 @@ fn cleanup_groups() {
     let (session, _) = child.create_session().unwrap();
 
     child.exit();
+    child.transition_to_zombie();
     child.free();
     drop(child);
 
