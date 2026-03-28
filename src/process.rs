@@ -306,3 +306,273 @@ static INIT_PROC: LazyInit<Arc<Process>> = LazyInit::new();
 pub fn init_proc() -> Arc<Process> {
     INIT_PROC.get().unwrap().clone()
 }
+
+#[cfg(test)]
+pub(crate) fn is_init_initialized() -> bool {
+    INIT_PROC.get().is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    fn ensure_init() {
+        // Try to get init proc, if it fails, initialize it
+        if INIT_PROC.get().is_none() {
+            // Use a static flag to prevent multiple initializations
+            static INIT_FLAG: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !INIT_FLAG.swap(true, core::sync::atomic::Ordering::SeqCst) {
+                Process::new_init(alloc_pid());
+            } else {
+                // Another thread/test already initialized, wait a bit and check again
+                // In single-threaded tests, this shouldn't happen, but be safe
+                while INIT_PROC.get().is_none() {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    fn alloc_pid() -> Pid {
+        static COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1000);
+        COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn test_pid() {
+        ensure_init();
+        let init = init_proc();
+        assert_eq!(init.pid(), init.pid());
+    }
+
+    #[test]
+    fn test_is_init() {
+        ensure_init();
+        let init = init_proc();
+        assert!(init.is_init());
+
+        let child = init.fork(alloc_pid());
+        assert!(!child.is_init());
+    }
+
+    #[test]
+    fn test_parent_child_relationship() {
+        ensure_init();
+        let parent = init_proc();
+        let child = parent.fork(alloc_pid());
+
+        assert_eq!(child.parent().unwrap().pid(), parent.pid());
+        assert!(parent.children().iter().any(|c| c.pid() == child.pid()));
+    }
+
+    #[test]
+    fn test_multiple_children() {
+        ensure_init();
+        let parent = init_proc();
+        let child1 = parent.fork(alloc_pid());
+        let child2 = parent.fork(alloc_pid());
+
+        let children = parent.children();
+        assert!(children.iter().any(|c| c.pid() == child1.pid()));
+        assert!(children.iter().any(|c| c.pid() == child2.pid()));
+        assert!(children.len() >= 2);
+    }
+
+    #[test]
+    fn test_group_inheritance() {
+        ensure_init();
+        let parent = init_proc();
+        let child = parent.fork(alloc_pid());
+
+        assert_eq!(child.group().pgid(), parent.group().pgid());
+    }
+
+    #[test]
+    fn test_create_group() {
+        ensure_init();
+        let parent = init_proc();
+        let child = parent.fork(alloc_pid());
+
+        let new_group = child.create_group().unwrap();
+        assert_eq!(new_group.pgid(), child.pid());
+        assert_eq!(child.group().pgid(), child.pid());
+    }
+
+    #[test]
+    fn test_create_group_already_leader() {
+        ensure_init();
+        let process = init_proc();
+
+        // Init process is already a group leader
+        assert!(process.create_group().is_none());
+    }
+
+    #[test]
+    fn test_create_session() {
+        ensure_init();
+        let parent = init_proc();
+        let child = parent.fork(alloc_pid());
+
+        let (session, group) = child.create_session().unwrap();
+        assert_eq!(session.sid(), child.pid());
+        assert_eq!(group.pgid(), child.pid());
+    }
+
+    #[test]
+    fn test_create_session_already_leader() {
+        ensure_init();
+        let process = init_proc();
+
+        // Init process is already a session leader
+        assert!(process.create_session().is_none());
+    }
+
+    #[test]
+    fn test_move_to_group() {
+        ensure_init();
+        let parent = init_proc();
+        let child1 = parent.fork(alloc_pid());
+        let child2 = parent.fork(alloc_pid());
+
+        let group1 = child1.create_group().unwrap();
+        assert!(child2.move_to_group(&group1));
+        assert_eq!(child2.group().pgid(), group1.pgid());
+    }
+
+    #[test]
+    fn test_move_to_same_group() {
+        ensure_init();
+        let parent = init_proc();
+        let child = parent.fork(alloc_pid());
+        let group = child.group();
+
+        assert!(child.move_to_group(&group));
+    }
+
+    #[test]
+    fn test_move_to_different_session() {
+        ensure_init();
+        let parent = init_proc();
+        let child1 = parent.fork(alloc_pid());
+        let child2 = parent.fork(alloc_pid());
+
+        let (_, group1) = child1.create_session().unwrap();
+        assert!(!child2.move_to_group(&group1));
+    }
+
+    #[test]
+    fn test_thread_management() {
+        ensure_init();
+        let process = init_proc();
+
+        process.add_thread(1);
+        process.add_thread(2);
+        process.add_thread(3);
+
+        let mut threads = process.threads();
+        threads.sort();
+        assert_eq!(threads, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_exit_thread() {
+        ensure_init();
+        let child = init_proc().fork(alloc_pid());
+
+        child.add_thread(1);
+        child.add_thread(2);
+
+        let last = child.exit_thread(1, 42);
+        assert!(!last);
+        assert_eq!(child.exit_code(), 42);
+        assert!(child.threads().contains(&2));
+        assert!(!child.threads().contains(&1));
+
+        // Without group_exit, exit code will be updated
+        let last = child.exit_thread(2, 99);
+        assert!(last);
+        assert_eq!(child.exit_code(), 99);
+        assert!(child.threads().is_empty());
+    }
+
+    #[test]
+    fn test_group_exit() {
+        ensure_init();
+        let child = init_proc().fork(alloc_pid());
+
+        child.add_thread(1);
+        child.group_exit();
+        assert!(child.is_group_exited());
+
+        // Exit code should not change after group exit
+        let exit_code_before = child.exit_code();
+        child.exit_thread(1, 99);
+        assert_eq!(child.exit_code(), exit_code_before);
+    }
+
+    #[test]
+    fn test_is_zombie() {
+        ensure_init();
+        let child = init_proc().fork(alloc_pid());
+
+        assert!(!child.is_zombie());
+    }
+
+    #[test]
+    fn test_exit() {
+        ensure_init();
+        let parent = init_proc();
+        let child = parent.fork(alloc_pid());
+
+        child.exit();
+        assert!(child.is_zombie());
+        assert!(parent.children().iter().any(|c| c.pid() == child.pid()));
+    }
+
+    #[test]
+    fn test_exit_init_process() {
+        ensure_init();
+        let init = init_proc();
+
+        // Exit init process should not panic, but should do nothing
+        init.exit();
+        assert!(!init.is_zombie());
+    }
+
+    #[test]
+    fn test_exit_child_reaping() {
+        ensure_init();
+        let init = init_proc();
+        let parent = init.fork(alloc_pid());
+        let child = parent.fork(alloc_pid());
+
+        parent.exit();
+        assert_eq!(child.parent().unwrap().pid(), init.pid());
+    }
+
+    #[test]
+    fn test_free_zombie() {
+        ensure_init();
+        let parent = init_proc();
+        let child = parent.fork(alloc_pid());
+        let child_pid = child.pid();
+
+        child.exit();
+        assert!(child.is_zombie());
+        assert!(parent.children().iter().any(|c| c.pid() == child_pid));
+
+        child.free();
+        assert!(!parent.children().iter().any(|c| c.pid() == child_pid));
+    }
+
+    #[test]
+    #[should_panic(expected = "only zombie process can be freed")]
+    fn test_free_not_zombie() {
+        ensure_init();
+        let process = init_proc().fork(alloc_pid());
+        process.free();
+    }
+}
